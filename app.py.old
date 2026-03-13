@@ -1,0 +1,502 @@
+# ======================================================================
+#  app.py — Gestion des plans de table pour un loto
+#  ======================================================================
+#  Fonctionnalités : - Réservations : nom, téléphone (obligatoire),
+#  email (option), cartons, places - Stockage en base de données SQLite
+#  - Allocation automatique des tables (8 max par table) - Génération du
+#  plan de salle (graphique) - Coloration avancée selon taux
+#  d’occupation - Export CSV
+#
+# ======================================================================
+
+import math
+import re
+import uuid
+import sqlite3
+from datetime import datetime
+from math import ceil
+from typing import List, Dict, Tuple
+
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+
+
+# ======================================================================
+#  Base de données SQLite
+# ======================================================================
+DB_PATH = "loto.db"
+
+
+def create_database():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reservations (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            email TEXT,
+            places INTEGER NOT NULL,
+            cartons INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+create_database()
+
+def next_res_id() -> str:
+    """
+    Retourne le prochain identifiant de réservation au format RES00001, RES00002, ...
+    - Ignore les anciens IDs non conformes (UUID, etc.)
+    - Transaction courte pour éviter les collisions en cas d'accès concurrent
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")  # verrou court, le temps de lire+calculer
+        cursor.execute("""
+            SELECT COALESCE(MAX(CAST(SUBSTR(id, 4) AS INTEGER)), 0)
+            FROM reservations
+            WHERE id LIKE 'RES_____%' -- 'RES' + au moins 5 chiffres (sécurité)
+               OR id GLOB 'RES[0-9][0-9][0-9][0-9][0-9]*'
+        """)
+        last_num = cursor.fetchone()[0] or 0
+        new_num = last_num + 1
+        new_id = f"Resa_{new_num:03d}"
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def insert_reservation(res_id, name, phone, email, places, cartons):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO reservations (id, name, phone, email, places, cartons, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (res_id, name, phone, email, places, cartons, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def next_res_id(prefix: str = "RES", width: int = 5) -> str:
+    """
+    Génère le prochain identifiant de réservation au format RES00001, RES00002, ...
+    - Ne considère que les IDs commençant par le préfixe
+    - Verrouille la base (BEGIN IMMEDIATE) pour éviter les collisions
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")  # verrou court
+        cur.execute("SELECT id FROM reservations WHERE id LIKE ?;", (prefix + '%',))
+        rows = cur.fetchall()
+
+        if not rows:
+            new_id = f"{prefix}{1:0{width}d}"
+        else:
+            nums = []
+            for (rid,) in rows:
+                if rid.startswith(prefix):
+                    try:
+                        nums.append(int(rid[len(prefix):]))
+                    except ValueError:
+                        pass
+            last = max(nums) if nums else 0
+            new_id = f"{prefix}{last + 1:0{width}d}"
+
+        conn.commit()
+        return new_id
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def get_reservations():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, name, phone, email, places, cartons
+        FROM reservations
+    """)
+    data = cursor.fetchall()
+    conn.close()
+    return data
+
+
+def delete_reservation(res_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM reservations WHERE id = ?", (res_id,))
+    conn.commit()
+    conn.close()
+
+
+# ======================================================================
+#  Interface Streamlit – configuration générale
+# ======================================================================
+st.set_page_config(
+    page_title="Plans de table - Loto",
+    page_icon="🎟️",
+    layout="wide",
+)
+
+st.sidebar.image("logo.png", width=180)
+st.title("🎟️ Gestion des plans de table (Loto)")
+st.caption("Tables de 8 personnes max • Capacité totale 300 personnes")
+
+
+# ======================================================================
+#  Paramètres de la salle
+# ======================================================================
+st.sidebar.header("Paramètres")
+
+TABLE_CAPACITY = st.sidebar.number_input(
+    "Capacité par table",
+    min_value=2, max_value=20, value=8, step=1
+)
+
+MAX_PEOPLE = st.sidebar.number_input(
+    "Capacité totale",
+    min_value=20, max_value=1000, value=300, step=10
+)
+
+override_tables = st.sidebar.checkbox("Définir manuellement le nombre de tables")
+manual_tables = None
+if override_tables:
+    manual_tables = st.sidebar.number_input(
+        "Nombre de tables imposé",
+        min_value=1, max_value=400, value=10, step=1
+    )
+
+if st.sidebar.button("🧹 Réinitialiser les réservations"):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM reservations")
+    conn.commit()
+    conn.close()
+    st.rerun()
+
+
+# ======================================================================
+#  Validation téléphone + email
+# ======================================================================
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE_FR = re.compile(r"^(?:\+33\s?|0)(?:[1-9])(?:[\s\-]?\d{2}){4}$")
+PHONE_RE_ALT = re.compile(r"^\+?\d{8,15}$")
+
+
+def is_phone_valid(phone: str) -> bool:
+    p = phone.strip()
+    return bool(PHONE_RE_FR.match(p) or PHONE_RE_ALT.match(p))
+
+
+# ======================================================================
+#  Fractionnement d'une réservation > TABLE_CAPACITY
+# ======================================================================
+def split_reservations(reservations: List[Dict], cap: int) -> List[Dict]:
+    chunks = []
+    for r in reservations:
+        rem = int(r["places"])
+        part = 1
+        while rem > cap:
+            chunks.append({
+                "id": f"{r['id']}-{part}",
+                "name": r["name"],
+                "phone": r["phone"],
+                "email": r["email"],
+                "cartons": r["cartons"],
+                "places": cap,
+            })
+            rem -= cap
+            part += 1
+
+        if rem > 0:
+            chunks.append({
+                "id": f"{r['id']}-{part}",
+                "name": r["name"],
+                "phone": r["phone"],
+                "email": r["email"],
+                "cartons": r["cartons"],
+                "places": rem,
+            })
+    return chunks
+
+
+# ======================================================================
+#  Allocation automatique des tables
+# ======================================================================
+def allocate_tables(reservations: List[Dict], cap: int, max_people: int, manual_tables: int | None):
+    total_people = sum(int(r["places"]) for r in reservations)
+
+    if total_people == 0:
+        return [], {"total_people": 0, "tables": 0, "capacity": 0, "free": 0, "fill_rate": 0, "unplaced": []}
+
+    if total_people > max_people:
+        return [], {"error": f"Capacité totale dépassée : {total_people} > {max_people}", "unplaced": []}
+
+    chunks = split_reservations(reservations, cap)
+    chunks.sort(key=lambda x: x["places"], reverse=True)
+
+    needed_tables = math.ceil(total_people / cap)
+    T = manual_tables if manual_tables else needed_tables
+
+    tables = [{"table_no": i + 1, "items": [], "free": cap} for i in range(T)]
+    unplaced = []
+
+    for c in chunks:
+        placed = False
+        for t in tables:
+            if t["free"] >= c["places"]:
+                t["items"].append(c)
+                t["free"] -= c["places"]
+                placed = True
+                break
+
+        if not placed:
+            if manual_tables:
+                unplaced.append(c)
+            else:
+                new_no = len(tables) + 1
+                tables.append({"table_no": new_no, "items": [c], "free": cap - c["places"]})
+
+    capacity = len(tables) * cap
+    return tables, {
+        "total_people": total_people,
+        "tables": len(tables),
+        "capacity": capacity,
+        "free": sum(t["free"] for t in tables),
+        "fill_rate": total_people / capacity,
+        "unplaced": unplaced
+    }
+
+
+# ======================================================================
+#  FONCTION : Plan de salle (graphique) + COLORATION AVANCÉE
+# ======================================================================
+import plotly.graph_objects as go
+from math import ceil
+
+def build_hall_plan(
+    tables: list,
+    cols: int = 3,
+    circular: bool = False,
+    table_size: float = 40,
+    h_gap: float = 0.02,
+    v_gap: float = 0.04,
+    font_size: int = 10,
+) -> "go.Figure":
+
+    n = len(tables)
+    if n == 0:
+        fig = go.Figure()
+        fig.add_annotation(text="Aucune table à afficher", showarrow=False)
+        return fig
+
+    rows = ceil(n / cols)
+
+    width = cols * (table_size + h_gap) + h_gap
+    height = rows * (table_size + v_gap) + v_gap
+
+    fig = go.Figure()
+
+    # -----------------------------
+    # COLORATION AVANCÉE
+    # -----------------------------
+    def occupancy_color(free, cap=TABLE_CAPACITY):
+        used = (cap - free) / cap
+        if used <= 0.40:
+            return "#b2f2bb"   # vert
+        elif used <= 0.70:
+            return "#fff3bf"   # jaune
+        elif used <= 0.90:
+            return "#ffd8a8"   # orange
+        else:
+            return "#ffa8a8"   # rouge
+
+    # -----------------------------
+    # Rendu des tables
+    # -----------------------------
+    for idx, t in enumerate(tables):
+
+        r = idx // cols
+        c = idx % cols
+
+        cx = h_gap + table_size / 2 + c * (table_size + h_gap)
+        cy = height - (v_gap + table_size / 2 + r * (table_size + v_gap))
+
+        x0, y0 = cx - table_size / 2, cy - table_size / 2
+        x1, y1 = cx + table_size / 2, cy + table_size / 2
+
+        # couleur selon taux occupation
+        color = occupancy_color(t["free"])
+
+        fig.add_shape(
+            type="rect",
+            x0=x0, y0=y0, x1=x1, y1=y1,
+            fillcolor=color,
+            line=dict(color="#1c7ed6", width=3),
+        )
+
+        # --------------------------------------
+        #   TEXTE 3 LIGNES PAR RÉSERVATION
+        # --------------------------------------
+        lines = [f"<b>Table {t['table_no']}</b>"]  # titre
+
+        items = t.get("items", [])
+        if items:
+            for it in items:
+                name = str(it.get("name", "")).strip()
+                phone = str(it.get("phone", "")).strip()
+                places = int(it.get("places", 0))
+
+                if len(name) > 22:
+                    name = name[:21] + "…"
+
+                block = (
+                    name + "<br>" +
+                    (f"📞 {phone}" if phone else "") + "<br>" +
+                    f"{places} pers."
+                )
+
+                lines.append(block)
+        else:
+            lines.append("Libre")
+
+        text = "<br><br>".join(lines)
+
+        fig.add_annotation(
+            x=cx, y=cy,
+            text=text,
+            showarrow=False,
+            font=dict(size=font_size, color="#222"),
+            align="center",
+        )
+
+    # -----------------------------
+    # Axes & Layout
+    # -----------------------------
+    fig.update_xaxes(visible=False, range=[0, width])
+    fig.update_yaxes(visible=False, range=[0, height], scaleanchor="x", scaleratio=1)
+
+    fig.update_layout(
+        height=min(1400, int(350 * rows)),
+        margin=dict(l=20, r=20, t=40, b=20),
+        title=f"Plan de salle – {len(tables)} table(s)",
+        plot_bgcolor="white",
+    )
+
+    return fig
+
+
+# ======================================================================
+#  Formulaire d'ajout de réservation
+# ======================================================================
+with st.form("add_res_form", clear_on_submit=True):
+    st.subheader("➕ Ajouter une réservation")
+
+    name = st.text_input("Nom du réservant *")
+    phone = st.text_input("Numéro de Téléphone *", placeholder="Exemple de saisie :    +33 6 12 34 56 78    ou    06 88 41 06 36")
+    email = st.text_input("Adresse Email (option)")
+    places = st.number_input("Nombre de places *", min_value=1, max_value=MAX_PEOPLE, value=2)
+    cartons = st.number_input("Nombre de cartons", min_value=0, max_value=100, value=0)
+
+    submitted = st.form_submit_button("Ajouter")
+    if submitted:
+        if not name.strip():
+            st.error("Nom obligatoire")
+        elif not is_phone_valid(phone):
+            st.error("Téléphone invalide")
+        elif email.strip() and not EMAIL_RE.match(email.strip()):
+            st.error("Email invalide")
+        else:
+
+            # Génère un ID propre, sans collision
+            res_id = next_res_id()
+
+            try:
+                insert_reservation(
+                    res_id,
+                    name.strip(),
+                    phone.strip(),
+                    email.strip(),
+                    int(places),
+                    int(cartons)
+                )
+                st.success(f"Réservation ajoutée (ID {res_id}).")
+                st.rerun()
+
+            except sqlite3.IntegrityError:
+                st.error("Erreur : impossible d'insérer l'ID (collision). Réessayez.")
+
+
+
+# ======================================================================
+#  Liste des réservations + suppression
+# ======================================================================
+st.subheader("📋 Réservations")
+
+rows = get_reservations()
+if not rows:
+    st.info("Aucune réservation.")
+else:
+    df = pd.DataFrame(rows, columns=["ID", "Réservant", "Téléphone", "Email", "Places", "Cartons"])
+    st.dataframe(df, use_container_width=True)
+
+    id_to_del = st.selectbox("ID à supprimer", df["ID"].tolist())
+    if st.button("🗑️ Supprimer"):
+        delete_reservation(id_to_del)
+        st.success("Supprimé")
+        st.rerun()
+
+
+# ======================================================================
+#  Génération du plan de tables
+# ======================================================================
+st.subheader("🪑 Générer le plan")
+
+if st.button("⚙️ Cliquez ici pour générer le plan de la salle"):
+    reservations = [
+        {
+            "id": r[0], "name": r[1], "phone": r[2],
+            "email": r[3], "places": r[4], "cartons": r[5]
+        }
+        for r in rows
+    ]
+    tables, stats = allocate_tables(reservations, TABLE_CAPACITY, MAX_PEOPLE, manual_tables)
+
+    if "error" in stats:
+        st.error(stats["error"])
+    else:
+        st.session_state.plan = {"tables": tables, "stats": stats}
+        st.success("Plan généré")
+
+
+# ======================================================================
+#  AFFICHAGE : Plan graphique
+# ======================================================================
+st.subheader("🗺️ Plan graphique de la salle")
+
+if st.session_state.get("plan"):
+    tables = st.session_state["plan"]["tables"]
+
+    fig = build_hall_plan(
+        tables,
+        cols=4,
+        circular=False,
+        table_size=1.4,
+        font_size=12
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.info("Aucun plan généré.")

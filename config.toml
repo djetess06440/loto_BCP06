@@ -1,0 +1,8 @@
+# .streamlit/config.toml
+[theme]
+base="light"           # "dark" ou "light"
+primaryColor="#0d47a1" # boutons, sliders, select
+backgroundColor="#f5f7fb"
+secondaryBackgroundColor="#ffffff"
+textColor="#1c1c1c"
+font="sans serif"

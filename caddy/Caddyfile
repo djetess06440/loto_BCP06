@@ -1,0 +1,4 @@
+localhost {
+    tls C:/Users/FRK4PCC00022/Desktop/TEST LOGICIEL PYTHON/localhost.pem C:/Users/FRK4PCC00022/Desktop/TEST LOGICIEL PYTHON/localhost-key.pem
+    reverse_proxy localhost:8501
+}
